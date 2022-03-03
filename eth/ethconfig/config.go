@@ -46,8 +46,8 @@ var FullNodeGPO = gasprice.Config{
 	Percentile:       60,
 	MaxHeaderHistory: 1024,
 	MaxBlockHistory:  1024,
-	MaxPrice:         gasprice.DefaultMaxPrice,
-	IgnorePrice:      gasprice.DefaultIgnorePrice,
+	MaxPrice:         gasprice.DefaultMaxPrioFee,
+	IgnorePrice:      gasprice.DefaultIgnorePrioFee,
 }
 
 // LightClientGPO contains default gasprice oracle settings for light client.
@@ -56,8 +56,8 @@ var LightClientGPO = gasprice.Config{
 	Percentile:       60,
 	MaxHeaderHistory: 300,
 	MaxBlockHistory:  5,
-	MaxPrice:         gasprice.DefaultMaxPrice,
-	IgnorePrice:      gasprice.DefaultIgnorePrice,
+	MaxPrice:         gasprice.DefaultMaxPrioFee,
+	IgnorePrice:      gasprice.DefaultIgnorePrioFee,
 }
 
 // Defaults contains default settings for use on the Ethereum main net.

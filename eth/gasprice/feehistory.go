@@ -58,9 +58,9 @@ type blockFees struct {
 
 // processedFees contains the results of a processed block and is also used for caching
 type processedFees struct {
-	reward               []*big.Int
-	baseFee, nextBaseFee *big.Int
-	gasUsedRatio         float64
+	reward       []*big.Int
+	baseFee      *big.Int
+	gasUsedRatio float64
 }
 
 // txGasAndReward is sorted in ascending order based on reward
@@ -84,14 +84,8 @@ func (s sortGasAndReward) Less(i, j int) bool {
 // the block field filled in, retrieves the block from the backend if not present yet and
 // fills in the rest of the fields.
 func (oracle *Oracle) processBlock(bf *blockFees, percentiles []float64) {
-	chainconfig := oracle.backend.ChainConfig()
 	if bf.results.baseFee = bf.header.BaseFee; bf.results.baseFee == nil {
-		bf.results.baseFee = new(big.Int)
-	}
-	if chainconfig.IsLondon(big.NewInt(int64(bf.blockNumber + 1))) {
-		bf.results.nextBaseFee = misc.CalcBaseFee(chainconfig, bf.header)
-	} else {
-		bf.results.nextBaseFee = new(big.Int)
+		bf.results.baseFee = common.Big0
 	}
 	bf.results.gasUsedRatio = float64(bf.header.GasUsed) / float64(bf.header.GasLimit)
 	if len(percentiles) == 0 {
@@ -107,28 +101,39 @@ func (oracle *Oracle) processBlock(bf *blockFees, percentiles []float64) {
 	if len(bf.block.Transactions()) == 0 {
 		// return an all zero row if there are no transactions to gather data from
 		for i := range bf.results.reward {
-			bf.results.reward[i] = new(big.Int)
+			bf.results.reward[i] = DefaultMinPrioFee
 		}
 		return
 	}
 
 	sorter := make(sortGasAndReward, len(bf.block.Transactions()))
+	var numValidTx int
 	for i, tx := range bf.block.Transactions() {
-		reward, _ := tx.EffectiveGasTip(bf.block.BaseFee())
-		sorter[i] = txGasAndReward{gasUsed: bf.receipts[i].GasUsed, reward: reward}
-	}
-	sort.Sort(sorter)
-
-	var txIndex int
-	sumGasUsed := sorter[0].gasUsed
-
-	for i, p := range percentiles {
-		thresholdGasUsed := uint64(float64(bf.block.GasUsed()) * p / 100)
-		for sumGasUsed < thresholdGasUsed && txIndex < len(bf.block.Transactions())-1 {
-			txIndex++
-			sumGasUsed += sorter[txIndex].gasUsed
+		if reward, err := tx.EffectiveGasTip(bf.block.BaseFee()); err == nil {
+			sorter[numValidTx] = txGasAndReward{gasUsed: bf.receipts[i].GasUsed, reward: reward}
+			numValidTx++
 		}
-		bf.results.reward[i] = sorter[txIndex].reward
+	}
+
+	if numValidTx > 0 {
+		sorter = sorter[:numValidTx]
+		sort.Sort(sorter)
+
+		var txIndex int
+		sumGasUsed := sorter[0].gasUsed
+
+		for i, p := range percentiles {
+			thresholdGasUsed := uint64(float64(bf.block.GasUsed()) * p / 100)
+			for sumGasUsed < thresholdGasUsed && txIndex < numValidTx-1 {
+				txIndex++
+				sumGasUsed += sorter[txIndex].gasUsed
+			}
+			bf.results.reward[i] = sorter[txIndex].reward
+		}
+	} else {
+		for i := range bf.results.reward {
+			bf.results.reward[i] = DefaultMinPrioFee
+		}
 	}
 }
 
@@ -170,11 +175,36 @@ func (oracle *Oracle) resolveBlockRange(ctx context.Context, lastBlock rpc.Block
 	} else if pendingBlock == nil && lastBlock > headBlock {
 		return nil, nil, 0, 0, fmt.Errorf("%w: requested %d, head %d", errRequestBeyondHead, lastBlock, headBlock)
 	}
-	// ensure not trying to retrieve before genesis
+	// ensure not trying to retrieve anything at or before genesis (the genesis block is removed by intention as it doesn't contain a baseFee)
 	if rpc.BlockNumber(blocks) > lastBlock+1 {
 		blocks = int(lastBlock + 1)
 	}
+
 	return pendingBlock, pendingReceipts, uint64(lastBlock), blocks, nil
+}
+
+// getBaseFee calculates the baseFee based on header
+func (oracle *Oracle) getBaseFee(header *types.Header) *big.Int {
+	if oracle.backend.ChainConfig().IsLondon(header.Number) {
+		return common.Big0
+	}
+
+	// we are looking for a past basefee, try cache first
+	cacheKey := struct {
+		common.Hash
+	}{header.Hash()}
+
+	if cacheVal, ok := oracle.baseFeeCache.Get(cacheKey); ok {
+		return cacheVal.(baseFeeCacheResut).baseFee
+	}
+
+	// we have to retrieve the baseFee from db
+	value := misc.CalcBaseFee(oracle.backend.ChainConfig(), header)
+
+	// Set the value in the cache
+	oracle.baseFeeCache.Add(cacheKey, baseFeeCacheResut{value})
+
+	return header.BaseFee
 }
 
 // FeeHistory returns data relevant for fee estimation based on the specified range of blocks.
@@ -256,6 +286,7 @@ func (oracle *Oracle) FeeHistory(ctx context.Context, blocks int, unresolvedLast
 					} else {
 						if len(rewardPercentiles) != 0 {
 							fees.block, fees.err = oracle.backend.BlockByNumber(ctx, rpc.BlockNumber(blockNumber))
+
 							if fees.block != nil && fees.err == nil {
 								fees.receipts, fees.err = oracle.backend.GetReceipts(ctx, fees.block.Hash())
 								fees.header = fees.block.Header()
@@ -277,10 +308,12 @@ func (oracle *Oracle) FeeHistory(ctx context.Context, blocks int, unresolvedLast
 		}()
 	}
 	var (
-		reward       = make([][]*big.Int, blocks)
-		baseFee      = make([]*big.Int, blocks+1)
-		gasUsedRatio = make([]float64, blocks)
-		firstMissing = blocks
+		reward          = make([][]*big.Int, blocks)
+		baseFee         = make([]*big.Int, blocks+1)
+		gasUsedRatio    = make([]float64, blocks)
+		firstMissing    = blocks
+		latestHeaderPos = -1
+		latestHeader    *types.Header
 	)
 	for ; blocks > 0; blocks-- {
 		fees := <-results
@@ -288,18 +321,28 @@ func (oracle *Oracle) FeeHistory(ctx context.Context, blocks int, unresolvedLast
 			return common.Big0, nil, nil, nil, fees.err
 		}
 		i := int(fees.blockNumber - oldestBlock)
-		if fees.results.baseFee != nil {
-			reward[i], baseFee[i], baseFee[i+1], gasUsedRatio[i] = fees.results.reward, fees.results.baseFee, fees.results.nextBaseFee, fees.results.gasUsedRatio
-		} else {
-			// getting no block and no error means we are requesting into the future (might happen because of a reorg)
-			if i < firstMissing {
-				firstMissing = i
+		if i < firstMissing {
+			if fees.results.baseFee != nil {
+				reward[i], baseFee[i], gasUsedRatio[i] = fees.results.reward, fees.results.baseFee, fees.results.gasUsedRatio
+			} else {
+				// getting no block and no error means we are requesting into the future (might happen because of a reorg)
+				if i < firstMissing {
+					firstMissing = i
+				}
+			}
+			if i < firstMissing && i > latestHeaderPos {
+				latestHeaderPos = i
+				latestHeader = fees.header
 			}
 		}
 	}
+
 	if firstMissing == 0 {
 		return common.Big0, nil, nil, nil, nil
 	}
+
+	baseFee[firstMissing] = oracle.getBaseFee(latestHeader)
+
 	if len(rewardPercentiles) != 0 {
 		reward = reward[:firstMissing]
 	} else {

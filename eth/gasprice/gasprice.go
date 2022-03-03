@@ -32,11 +32,13 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 )
 
-const sampleNumber = 3 // Number of transactions sampled in a block
+// Number of transactions sampled in a block
+const sampleNumber = 3
 
 var (
-	DefaultMaxPrice    = big.NewInt(500 * params.GWei)
-	DefaultIgnorePrice = big.NewInt(2 * params.Wei)
+	DefaultMinPrioFee    = big.NewInt(1 * params.GWei)
+	DefaultMaxPrioFee    = big.NewInt(500 * params.GWei)
+	DefaultIgnorePrioFee = big.NewInt(2 * params.Wei)
 )
 
 type Config struct {
@@ -59,20 +61,48 @@ type OracleBackend interface {
 	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
 }
 
+type baseFeeCacheResut struct {
+	baseFee *big.Int
+}
+
+type tipFeeCacheEntry struct {
+	blockNumber uint64
+	fee         *big.Int
+}
+
+type tipFeeCache struct {
+	// tipFeeCache
+	num   int
+	cache []tipFeeCacheEntry
+}
+
+type fees struct {
+	// Lock for headValue
+	lock sync.RWMutex
+
+	// latest evaluated block
+	tipFee *big.Int
+
+	// cache of tip fees
+	tipCache tipFeeCache
+}
+
 // Oracle recommends gas prices based on the content of recent
 // blocks. Suitable for both light and full clients.
 type Oracle struct {
-	backend     OracleBackend
-	lastHead    common.Hash
-	lastPrice   *big.Int
-	maxPrice    *big.Int
-	ignorePrice *big.Int
-	cacheLock   sync.RWMutex
-	fetchLock   sync.Mutex
+	backend OracleBackend
+	fees    fees
 
-	checkBlocks, percentile           int
-	maxHeaderHistory, maxBlockHistory int
-	historyCache                      *lru.Cache
+	maxPrioFee    *big.Int
+	ignorePrioFee *big.Int
+
+	checkBlocks, percentile int
+
+	// FeeHistory
+	maxHeaderHistory int
+	maxBlockHistory  int
+	historyCache     *lru.Cache
+	baseFeeCache     *lru.Cache
 }
 
 // NewOracle returns a new gasprice oracle which can recommend suitable
@@ -91,17 +121,17 @@ func NewOracle(backend OracleBackend, params Config) *Oracle {
 		percent = 100
 		log.Warn("Sanitizing invalid gasprice oracle sample percentile", "provided", params.Percentile, "updated", percent)
 	}
-	maxPrice := params.MaxPrice
-	if maxPrice == nil || maxPrice.Int64() <= 0 {
-		maxPrice = DefaultMaxPrice
-		log.Warn("Sanitizing invalid gasprice oracle price cap", "provided", params.MaxPrice, "updated", maxPrice)
+	maxTipPrice := params.MaxPrice
+	if maxTipPrice == nil || maxTipPrice.Int64() <= 0 {
+		maxTipPrice = DefaultMaxPrioFee
+		log.Warn("Sanitizing invalid gasprice oracle price cap", "provided", params.MaxPrice, "updated", maxTipPrice)
 	}
-	ignorePrice := params.IgnorePrice
-	if ignorePrice == nil || ignorePrice.Int64() <= 0 {
-		ignorePrice = DefaultIgnorePrice
-		log.Warn("Sanitizing invalid gasprice oracle ignore price", "provided", params.IgnorePrice, "updated", ignorePrice)
-	} else if ignorePrice.Int64() > 0 {
-		log.Info("Gasprice oracle is ignoring threshold set", "threshold", ignorePrice)
+	ignoreTipPrice := params.IgnorePrice
+	if ignoreTipPrice == nil || ignoreTipPrice.Int64() <= 0 {
+		ignoreTipPrice = DefaultIgnorePrioFee
+		log.Warn("Sanitizing invalid gasprice oracle ignore price", "provided", params.IgnorePrice, "updated", ignoreTipPrice)
+	} else if ignoreTipPrice.Int64() > 0 {
+		log.Info("Gasprice oracle is ignoring threshold set", "threshold", ignoreTipPrice)
 	}
 	maxHeaderHistory := params.MaxHeaderHistory
 	if maxHeaderHistory < 1 {
@@ -114,30 +144,46 @@ func NewOracle(backend OracleBackend, params Config) *Oracle {
 		log.Warn("Sanitizing invalid gasprice oracle max block history", "provided", params.MaxBlockHistory, "updated", maxBlockHistory)
 	}
 
-	cache, _ := lru.New(2048)
+	oracle := &Oracle{
+		backend:          backend,
+		maxPrioFee:       maxTipPrice,
+		ignorePrioFee:    ignoreTipPrice,
+		checkBlocks:      blocks,
+		percentile:       percent,
+		maxHeaderHistory: maxHeaderHistory,
+		maxBlockHistory:  maxBlockHistory,
+	}
+
+	oracle.historyCache, _ = lru.New(2048)
+	oracle.baseFeeCache, _ = lru.New(128)
+	oracle.fees.tipCache.cache = make([]tipFeeCacheEntry, blocks*sampleNumber)
+
+	oracle.fees.tipFee = DefaultMinPrioFee
+
 	headEvent := make(chan core.ChainHeadEvent, 1)
 	backend.SubscribeChainHeadEvent(headEvent)
 	go func() {
 		var lastHead common.Hash
 		for ev := range headEvent {
-			if ev.Block.ParentHash() != lastHead {
-				cache.Purge()
-			}
+			oracle.handleHeadEvent(ev.Block, ev.Block.ParentHash() == lastHead)
 			lastHead = ev.Block.Hash()
 		}
 	}()
 
-	return &Oracle{
-		backend:          backend,
-		lastPrice:        params.Default,
-		maxPrice:         maxPrice,
-		ignorePrice:      ignorePrice,
-		checkBlocks:      blocks,
-		percentile:       percent,
-		maxHeaderHistory: maxHeaderHistory,
-		maxBlockHistory:  maxBlockHistory,
-		historyCache:     cache,
+	return oracle
+}
+
+func (gpo *Oracle) handleHeadEvent(block *types.Block, contiguous bool) {
+	if !contiguous {
+		gpo.historyCache.Purge()
 	}
+
+	tipFee := gpo.calculateTipFee(block)
+
+	gpo.fees.lock.Lock()
+	defer gpo.fees.lock.Unlock()
+
+	gpo.fees.tipFee = tipFee
 }
 
 // SuggestTipCap returns a tip cap so that newly created transaction can have a
@@ -146,151 +192,92 @@ func NewOracle(backend OracleBackend, params Config) *Oracle {
 // Note, for legacy transactions and the legacy eth_gasPrice RPC call, it will be
 // necessary to add the basefee to the returned number to fall back to the legacy
 // behavior.
-func (oracle *Oracle) SuggestTipCap(ctx context.Context) (*big.Int, error) {
-	head, _ := oracle.backend.HeaderByNumber(ctx, rpc.LatestBlockNumber)
-	headHash := head.Hash()
+func (gpo *Oracle) SuggestTipCap(ctx context.Context) (*big.Int, error) {
+	gpo.fees.lock.RLock()
+	defer gpo.fees.lock.RUnlock()
 
-	// If the latest gasprice is still available, return it.
-	oracle.cacheLock.RLock()
-	lastHead, lastPrice := oracle.lastHead, oracle.lastPrice
-	oracle.cacheLock.RUnlock()
-	if headHash == lastHead {
-		return new(big.Int).Set(lastPrice), nil
-	}
-	oracle.fetchLock.Lock()
-	defer oracle.fetchLock.Unlock()
+	return new(big.Int).Set(gpo.fees.tipFee), nil
+}
 
-	// Try checking the cache again, maybe the last fetch fetched what we need
-	oracle.cacheLock.RLock()
-	lastHead, lastPrice = oracle.lastHead, oracle.lastPrice
-	oracle.cacheLock.RUnlock()
-	if headHash == lastHead {
-		return new(big.Int).Set(lastPrice), nil
-	}
-	var (
-		sent, exp int
-		number    = head.Number.Uint64()
-		result    = make(chan results, oracle.checkBlocks)
-		quit      = make(chan struct{})
-		results   []*big.Int
-	)
-	for sent < oracle.checkBlocks && number > 0 {
-		go oracle.getBlockValues(ctx, types.MakeSigner(oracle.backend.ChainConfig(), big.NewInt(int64(number))), number, sampleNumber, oracle.ignorePrice, result, quit)
-		sent++
-		exp++
-		number--
-	}
-	for exp > 0 {
-		res := <-result
-		if res.err != nil {
-			close(quit)
-			return new(big.Int).Set(lastPrice), res.err
+// tip fee cache sorter sorts in ascending order
+func (c tipFeeCache) Len() int           { return c.num }
+func (c tipFeeCache) Swap(i, j int)      { c.cache[i], c.cache[j] = c.cache[j], c.cache[i] }
+func (c tipFeeCache) Less(i, j int) bool { return c.cache[i].fee.Cmp(c.cache[j].fee) < 0 }
+
+// calculateTipFee updates tipCache by removing outdated blocks and adding
+// up to tipFeeHistorySamples (cheapest) new elements.
+// If we have enough data, we get a good candiate by selecting the
+// percentile position in our tipCache.
+func (gpo *Oracle) calculateTipFee(block *types.Block) *big.Int {
+	// remove all entries older than tipFeeHistoryBlocks
+	// also make sure that accidential future blocks are removed
+	cache := &gpo.fees.tipCache
+	signer := types.MakeSigner(gpo.backend.ChainConfig(), block.Number())
+
+	if block.Number().Uint64() >= uint64(gpo.checkBlocks) {
+		removal := block.Number().Uint64() - uint64(gpo.checkBlocks)
+		nextInsertPos := 0
+		for i := 0; i < cache.num; i++ {
+			if cache.cache[i].blockNumber > removal &&
+				cache.cache[i].blockNumber < block.Number().Uint64() {
+
+				if i != nextInsertPos {
+					cache.cache[nextInsertPos] = cache.cache[i]
+				}
+				nextInsertPos++
+			}
 		}
-		exp--
-		// Nothing returned. There are two special cases here:
-		// - The block is empty
-		// - All the transactions included are sent by the miner itself.
-		// In these cases, use the latest calculated price for sampling.
-		if len(res.values) == 0 {
-			res.values = []*big.Int{lastPrice}
-		}
-		// Besides, in order to collect enough data for sampling, if nothing
-		// meaningful returned, try to query more blocks. But the maximum
-		// is 2*checkBlocks.
-		if len(res.values) == 1 && len(results)+1+exp < oracle.checkBlocks*2 && number > 0 {
-			go oracle.getBlockValues(ctx, types.MakeSigner(oracle.backend.ChainConfig(), big.NewInt(int64(number))), number, sampleNumber, oracle.ignorePrice, result, quit)
-			sent++
-			exp++
-			number--
-		}
-		results = append(results, res.values...)
+		cache.num = nextInsertPos
 	}
-	price := lastPrice
-	if len(results) > 0 {
-		sort.Sort(bigIntArray(results))
-		price = results[(len(results)-1)*oracle.percentile/100]
-	}
-	if price.Cmp(oracle.maxPrice) > 0 {
-		price = new(big.Int).Set(oracle.maxPrice)
-	}
-	oracle.cacheLock.Lock()
-	oracle.lastHead = headHash
-	oracle.lastPrice = price
-	oracle.cacheLock.Unlock()
 
-	return new(big.Int).Set(price), nil
-}
+	// get max of tipFeeHistorySamples out of the new block
+	numResults := 0
+	var results [sampleNumber]tipFeeCacheEntry
 
-type results struct {
-	values []*big.Int
-	err    error
-}
-
-type txSorter struct {
-	txs     []*types.Transaction
-	baseFee *big.Int
-}
-
-func newSorter(txs []*types.Transaction, baseFee *big.Int) *txSorter {
-	return &txSorter{
-		txs:     txs,
-		baseFee: baseFee,
-	}
-}
-
-func (s *txSorter) Len() int { return len(s.txs) }
-func (s *txSorter) Swap(i, j int) {
-	s.txs[i], s.txs[j] = s.txs[j], s.txs[i]
-}
-func (s *txSorter) Less(i, j int) bool {
-	// It's okay to discard the error because a tx would never be
-	// accepted into a block with an invalid effective tip.
-	tip1, _ := s.txs[i].EffectiveGasTip(s.baseFee)
-	tip2, _ := s.txs[j].EffectiveGasTip(s.baseFee)
-	return tip1.Cmp(tip2) < 0
-}
-
-// getBlockPrices calculates the lowest transaction gas price in a given block
-// and sends it to the result channel. If the block is empty or all transactions
-// are sent by the miner itself(it doesn't make any sense to include this kind of
-// transaction prices for sampling), nil gasprice is returned.
-func (oracle *Oracle) getBlockValues(ctx context.Context, signer types.Signer, blockNum uint64, limit int, ignoreUnder *big.Int, result chan results, quit chan struct{}) {
-	block, err := oracle.backend.BlockByNumber(ctx, rpc.BlockNumber(blockNum))
-	if block == nil {
-		select {
-		case result <- results{nil, err}:
-		case <-quit:
-		}
-		return
-	}
-	// Sort the transaction by effective tip in ascending sort.
-	txs := make([]*types.Transaction, len(block.Transactions()))
-	copy(txs, block.Transactions())
-	sorter := newSorter(txs, block.BaseFee())
-	sort.Sort(sorter)
-
-	var prices []*big.Int
-	for _, tx := range sorter.txs {
-		tip, _ := tx.EffectiveGasTip(block.BaseFee())
-		if ignoreUnder != nil && tip.Cmp(ignoreUnder) == -1 {
+	for _, tx := range block.Transactions() {
+		// don't use coinbase transactions for calculation
+		sender, err := types.Sender(signer, tx)
+		if err != nil || sender == block.Coinbase() {
 			continue
 		}
-		sender, err := types.Sender(signer, tx)
-		if err == nil && sender != block.Coinbase() {
-			prices = append(prices, tip)
-			if len(prices) >= limit {
-				break
+		if tipFee, err := tx.EffectiveGasTip(block.BaseFee()); err == nil {
+			if err != nil || (gpo.ignorePrioFee != nil &&
+				tipFee.Cmp(gpo.ignorePrioFee) == -1) {
+				continue
+			}
+			insertPos := -1
+			if numResults < sampleNumber {
+				insertPos = numResults
+				numResults++
+			} else {
+				for i := 0; i < sampleNumber; i++ {
+					if results[i].fee.Cmp(tipFee) > 0 && (insertPos < 0 ||
+						results[i].fee.Cmp(results[insertPos].fee) > 0) {
+						insertPos = i
+					}
+				}
+			}
+			if insertPos >= 0 {
+				results[insertPos] = tipFeeCacheEntry{blockNumber: block.Number().Uint64(), fee: tipFee}
 			}
 		}
 	}
-	select {
-	case result <- results{prices, nil}:
-	case <-quit:
+	if numResults > 0 {
+		for numResults > 0 {
+			numResults--
+			cache.cache[cache.num] = results[numResults]
+			cache.num++
+		}
+		sort.Sort(cache)
 	}
+	if cache.num >= gpo.checkBlocks {
+		tipFee := cache.cache[(cache.num*gpo.percentile)/100].fee
+		if tipFee.Cmp(DefaultMinPrioFee) < 0 {
+			tipFee = DefaultMinPrioFee
+		} else if tipFee.Cmp(gpo.maxPrioFee) > 0 {
+			tipFee = gpo.maxPrioFee
+		}
+		return tipFee
+	}
+	return gpo.fees.tipFee
 }
-
-type bigIntArray []*big.Int
-
-func (s bigIntArray) Len() int           { return len(s) }
-func (s bigIntArray) Less(i, j int) bool { return s[i].Cmp(s[j]) < 0 }
-func (s bigIntArray) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }

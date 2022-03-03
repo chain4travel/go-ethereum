@@ -160,9 +160,16 @@ func (b *testBackend) GetBlockByNumber(number uint64) *types.Block {
 	return b.chain.GetBlockByNumber(number)
 }
 
+func (b *testBackend) emitEvents(oracle *Oracle) {
+	for i := 1; i <= testHead; i++ {
+		block := b.GetBlockByNumber(uint64(i))
+		oracle.handleHeadEvent(block, true)
+	}
+}
+
 func TestSuggestTipCap(t *testing.T) {
 	config := Config{
-		Blocks:     3,
+		Blocks:     6,
 		Percentile: 60,
 		Default:    big.NewInt(params.GWei),
 	}
@@ -179,6 +186,7 @@ func TestSuggestTipCap(t *testing.T) {
 	for _, c := range cases {
 		backend := newTestBackend(t, c.fork, false)
 		oracle := NewOracle(backend, config)
+		backend.emitEvents(oracle)
 
 		// The gas price sampled is: 32G, 31G, 30G, 29G, 28G, 27G
 		got, err := oracle.SuggestTipCap(context.Background())
